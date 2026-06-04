@@ -16,7 +16,7 @@ from enum import Enum
 from typing_extensions import override
 
 from comfy_api.latest import IO, ComfyExtension, Input, InputImpl
-from comfy_api_nodes.apis import (
+from comfy_api_nodes.apis.runway import (
     RunwayImageToVideoRequest,
     RunwayImageToVideoResponse,
     RunwayTaskStatusResponse as TaskStatusResponse,
@@ -140,7 +140,7 @@ class RunwayImageToVideoNodeGen3a(IO.ComfyNode):
         return IO.Schema(
             node_id="RunwayImageToVideoNodeGen3a",
             display_name="Runway Image to Video (Gen3a Turbo)",
-            category="api node/video/Runway",
+            category="partner/video/Runway",
             description="Generate a video from a single starting frame using Gen3a Turbo model. "
             "Before diving in, review these best practices to ensure that "
             "your input selections will set your generation up for success: "
@@ -184,6 +184,10 @@ class RunwayImageToVideoNodeGen3a(IO.ComfyNode):
                 IO.Hidden.unique_id,
             ],
             is_api_node=True,
+            price_badge=IO.PriceBadge(
+                depends_on=IO.PriceBadgeDepends(widgets=["duration"]),
+                expr="""{"type":"usd","usd": 0.0715 * widgets.duration}""",
+            ),
         )
 
     @classmethod
@@ -230,7 +234,7 @@ class RunwayImageToVideoNodeGen4(IO.ComfyNode):
         return IO.Schema(
             node_id="RunwayImageToVideoNodeGen4",
             display_name="Runway Image to Video (Gen4 Turbo)",
-            category="api node/video/Runway",
+            category="partner/video/Runway",
             description="Generate a video from a single starting frame using Gen4 Turbo model. "
             "Before diving in, review these best practices to ensure that "
             "your input selections will set your generation up for success: "
@@ -274,6 +278,10 @@ class RunwayImageToVideoNodeGen4(IO.ComfyNode):
                 IO.Hidden.unique_id,
             ],
             is_api_node=True,
+            price_badge=IO.PriceBadge(
+                depends_on=IO.PriceBadgeDepends(widgets=["duration"]),
+                expr="""{"type":"usd","usd": 0.0715 * widgets.duration}""",
+            ),
         )
 
     @classmethod
@@ -321,7 +329,7 @@ class RunwayFirstLastFrameNode(IO.ComfyNode):
         return IO.Schema(
             node_id="RunwayFirstLastFrameNode",
             display_name="Runway First-Last-Frame to Video",
-            category="api node/video/Runway",
+            category="partner/video/Runway",
             description="Upload first and last keyframes, draft a prompt, and generate a video. "
             "More complex transitions, such as cases where the Last frame is completely different "
             "from the First frame, may benefit from the longer 10s duration. "
@@ -372,6 +380,10 @@ class RunwayFirstLastFrameNode(IO.ComfyNode):
                 IO.Hidden.unique_id,
             ],
             is_api_node=True,
+            price_badge=IO.PriceBadge(
+                depends_on=IO.PriceBadgeDepends(widgets=["duration"]),
+                expr="""{"type":"usd","usd": 0.0715 * widgets.duration}""",
+            ),
         )
 
     @classmethod
@@ -428,7 +440,7 @@ class RunwayTextToImageNode(IO.ComfyNode):
         return IO.Schema(
             node_id="RunwayTextToImageNode",
             display_name="Runway Text to Image",
-            category="api node/image/Runway",
+            category="partner/image/Runway",
             description="Generate an image from a text prompt using Runway's Gen 4 model. "
             "You can also include reference image to guide the generation.",
             inputs=[
@@ -457,6 +469,9 @@ class RunwayTextToImageNode(IO.ComfyNode):
                 IO.Hidden.unique_id,
             ],
             is_api_node=True,
+            price_badge=IO.PriceBadge(
+                expr="""{"type":"usd","usd":0.11}""",
+            ),
         )
 
     @classmethod

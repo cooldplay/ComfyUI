@@ -1,4 +1,19 @@
+import logging
+
 import torch
+
+_CK_STOCHASTIC_ROUNDING_AVAILABLE = False
+try:
+    import comfy_kitchen as ck
+    _ck_stochastic_rounding_fp8 = ck.stochastic_rounding_fp8
+    _CK_STOCHASTIC_ROUNDING_AVAILABLE = True
+except (AttributeError, ImportError):
+    logging.warning("comfy_kitchen does not support stochastic FP8 rounding, please update comfy_kitchen.")
+
+if not _CK_STOCHASTIC_ROUNDING_AVAILABLE:
+    def _ck_stochastic_rounding_fp8(value, rng, dtype):
+        raise NotImplementedError("comfy_kitchen does not support stochastic FP8 rounding")
+
 
 def calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, generator=None):
     mantissa_scaled = torch.where(
@@ -57,6 +72,10 @@ def stochastic_rounding(value, dtype, seed=0):
     if dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2:
         generator = torch.Generator(device=value.device)
         generator.manual_seed(seed)
+        if _CK_STOCHASTIC_ROUNDING_AVAILABLE:
+            rng = torch.randint(0, 256, value.size(), dtype=torch.uint8, layout=value.layout, device=value.device, generator=generator)
+            return _ck_stochastic_rounding_fp8(value, rng, dtype)
+
         output = torch.empty_like(value, dtype=dtype)
         num_slices = max(1, (value.numel() / (4096 * 4096)))
         slice_size = max(1, round(value.shape[0] / num_slices))
@@ -137,10 +156,44 @@ def to_blocked(input_matrix, flatten: bool = True) -> torch.Tensor:
     return rearranged.reshape(padded_rows, padded_cols)
 
 
-def stochastic_round_quantize_nvfp4(x, per_tensor_scale, pad_16x, seed=0):
+def stochastic_round_quantize_nvfp4_block(x, per_tensor_scale, generator):
     F4_E2M1_MAX = 6.0
     F8_E4M3_MAX = 448.0
 
+    orig_shape = x.shape
+
+    block_size = 16
+
+    x = x.reshape(orig_shape[0], -1, block_size)
+    scaled_block_scales_fp8 = torch.clamp(((torch.amax(torch.abs(x), dim=-1)) / F4_E2M1_MAX) / per_tensor_scale.to(x.dtype), max=F8_E4M3_MAX).to(torch.float8_e4m3fn)
+    x = x / (per_tensor_scale.to(x.dtype) * scaled_block_scales_fp8.to(x.dtype)).unsqueeze(-1)
+
+    x = x.view(orig_shape).nan_to_num()
+    data_lp = stochastic_float_to_fp4_e2m1(x, generator=generator)
+    return data_lp, scaled_block_scales_fp8
+
+
+def stochastic_round_quantize_nvfp4(x, per_tensor_scale, pad_16x, seed=0):
+    def roundup(x: int, multiple: int) -> int:
+        """Round up x to the nearest multiple."""
+        return ((x + multiple - 1) // multiple) * multiple
+
+    generator = torch.Generator(device=x.device)
+    generator.manual_seed(seed)
+
+    # Handle padding
+    if pad_16x:
+        rows, cols = x.shape
+        padded_rows = roundup(rows, 16)
+        padded_cols = roundup(cols, 16)
+        if padded_rows != rows or padded_cols != cols:
+            x = torch.nn.functional.pad(x, (0, padded_cols - cols, 0, padded_rows - rows))
+
+    x, blocked_scaled = stochastic_round_quantize_nvfp4_block(x, per_tensor_scale, generator)
+    return x, to_blocked(blocked_scaled, flatten=False)
+
+
+def stochastic_round_quantize_nvfp4_by_block(x, per_tensor_scale, pad_16x, seed=0, block_size=4096 * 4096):
     def roundup(x: int, multiple: int) -> int:
         """Round up x to the nearest multiple."""
         return ((x + multiple - 1) // multiple) * multiple
@@ -158,28 +211,56 @@ def stochastic_round_quantize_nvfp4(x, per_tensor_scale, pad_16x, seed=0):
             # what we want to produce. If we pad here, we want the padded output.
             orig_shape = x.shape
 
-    block_size = 16
+    orig_shape = list(orig_shape)
 
-    x = x.reshape(orig_shape[0], -1, block_size)
-    max_abs = torch.amax(torch.abs(x), dim=-1)
-    block_scale = max_abs / F4_E2M1_MAX
-    scaled_block_scales = block_scale / per_tensor_scale.to(block_scale.dtype)
-    scaled_block_scales_fp8 = torch.clamp(scaled_block_scales, max=F8_E4M3_MAX).to(torch.float8_e4m3fn)
-    total_scale = per_tensor_scale.to(x.dtype) * scaled_block_scales_fp8.to(x.dtype)
-
-    # Handle zero blocks (from padding): avoid 0/0 NaN
-    zero_scale_mask = (total_scale == 0)
-    total_scale_safe = torch.where(zero_scale_mask, torch.ones_like(total_scale), total_scale)
-
-    x = x / total_scale_safe.unsqueeze(-1)
+    output_fp4 = torch.empty(orig_shape[:-1] + [orig_shape[-1] // 2], dtype=torch.uint8, device=x.device)
+    output_block = torch.empty(orig_shape[:-1] + [orig_shape[-1] // 16], dtype=torch.float8_e4m3fn, device=x.device)
 
     generator = torch.Generator(device=x.device)
     generator.manual_seed(seed)
 
-    x = torch.where(zero_scale_mask.unsqueeze(-1), torch.zeros_like(x), x)
+    num_slices = max(1, (x.numel() / block_size))
+    slice_size = max(1, (round(x.shape[0] / num_slices)))
 
-    x = x.view(orig_shape)
-    data_lp = stochastic_float_to_fp4_e2m1(x, generator=generator)
+    for i in range(0, x.shape[0], slice_size):
+        fp4, block = stochastic_round_quantize_nvfp4_block(x[i: i + slice_size], per_tensor_scale, generator=generator)
+        output_fp4[i:i + slice_size].copy_(fp4)
+        output_block[i:i + slice_size].copy_(block)
 
-    blocked_scales = to_blocked(scaled_block_scales_fp8, flatten=False)
-    return data_lp, blocked_scales
+    return output_fp4, to_blocked(output_block, flatten=False)
+
+
+def stochastic_round_quantize_mxfp8_by_block(x, pad_32x, seed=0):
+    def roundup(x_val, multiple):
+        return ((x_val + multiple - 1) // multiple) * multiple
+
+    if pad_32x:
+        rows, cols = x.shape
+        padded_rows = roundup(rows, 32)
+        padded_cols = roundup(cols, 32)
+        if padded_rows != rows or padded_cols != cols:
+            x = torch.nn.functional.pad(x, (0, padded_cols - cols, 0, padded_rows - rows))
+
+    F8_E4M3_MAX = 448.0
+    E8M0_BIAS = 127
+    BLOCK_SIZE = 32
+
+    rows, cols = x.shape
+    x_blocked = x.reshape(rows, -1, BLOCK_SIZE)
+    max_abs = torch.amax(torch.abs(x_blocked), dim=-1)
+
+    # E8M0 block scales (power-of-2 exponents)
+    scale_needed = torch.clamp(max_abs.float() / F8_E4M3_MAX, min=2**(-127))
+    exp_biased = torch.clamp(torch.ceil(torch.log2(scale_needed)).to(torch.int32) + E8M0_BIAS, 0, 254)
+    block_scales_e8m0 = exp_biased.to(torch.uint8)
+
+    zero_mask = (max_abs == 0)
+    block_scales_f32 = (block_scales_e8m0.to(torch.int32) << 23).view(torch.float32)
+    block_scales_f32 = torch.where(zero_mask, torch.ones_like(block_scales_f32), block_scales_f32)
+
+    # Scale per-block then stochastic round
+    data_scaled = (x_blocked.float() / block_scales_f32.unsqueeze(-1)).reshape(rows, cols)
+    output_fp8 = stochastic_rounding(data_scaled, torch.float8_e4m3fn, seed=seed)
+
+    block_scales_e8m0 = torch.where(zero_mask, torch.zeros_like(block_scales_e8m0), block_scales_e8m0)
+    return output_fp8, to_blocked(block_scales_e8m0, flatten=False).view(torch.float8_e8m0fnu)

@@ -9,6 +9,7 @@ import comfy.model_management
 import comfy.utils
 import comfy.clip_model
 import comfy.image_encoders.dino2
+import comfy.image_encoders.dino3
 
 class Output:
     def __getitem__(self, key):
@@ -23,12 +24,16 @@ IMAGE_ENCODERS = {
     "siglip_vision_model": comfy.clip_model.CLIPVisionModelProjection,
     "siglip2_vision_model": comfy.clip_model.CLIPVisionModelProjection,
     "dinov2": comfy.image_encoders.dino2.Dinov2Model,
+    "dinov3": comfy.image_encoders.dino3.DINOv3ViTModel,
 }
 
 class ClipVisionModel():
     def __init__(self, json_config):
-        with open(json_config) as f:
-            config = json.load(f)
+        if isinstance(json_config, dict):
+            config = json_config
+        else:
+            with open(json_config) as f:
+                config = json.load(f)
 
         self.image_size = config.get("image_size", 224)
         self.image_mean = config.get("image_mean", [0.48145466, 0.4578275, 0.40821073])
@@ -47,10 +52,10 @@ class ClipVisionModel():
         self.model = model_class(config, self.dtype, offload_device, comfy.ops.manual_cast)
         self.model.eval()
 
-        self.patcher = comfy.model_patcher.ModelPatcher(self.model, load_device=self.load_device, offload_device=offload_device)
+        self.patcher = comfy.model_patcher.CoreModelPatcher(self.model, load_device=self.load_device, offload_device=offload_device)
 
     def load_sd(self, sd):
-        return self.model.load_state_dict(sd, strict=False)
+        return self.model.load_state_dict(sd, strict=False, assign=self.patcher.is_dynamic())
 
     def get_sd(self):
         return self.model.state_dict()
@@ -66,6 +71,7 @@ class ClipVisionModel():
         outputs = Output()
         outputs["last_hidden_state"] = out[0].to(comfy.model_management.intermediate_device())
         outputs["image_embeds"] = out[2].to(comfy.model_management.intermediate_device())
+        outputs["image_sizes"] = [pixel_values.shape[1:]] * pixel_values.shape[0]
         if self.return_all_hidden_states:
             all_hs = out[1].to(comfy.model_management.intermediate_device())
             outputs["penultimate_hidden_states"] = all_hs[:, -2]
@@ -133,6 +139,8 @@ def load_clipvision_from_sd(sd, prefix="", convert_keys=False):
         json_config = os.path.join(os.path.join(os.path.dirname(os.path.realpath(__file__)), "image_encoders"), "dino2_giant.json")
     elif 'encoder.layer.23.layer_scale2.lambda1' in sd:
         json_config = os.path.join(os.path.join(os.path.dirname(os.path.realpath(__file__)), "image_encoders"), "dino2_large.json")
+    elif 'layer.0.mlp.gate_proj.weight' in sd and 'layer.31.norm1.weight' in sd: # Dinov3 ViT-H/16+ (SwiGLU gated MLP, 32 layers)
+        json_config = comfy.image_encoders.dino3.DINOV3_VITH_CONFIG
     else:
         return None
 

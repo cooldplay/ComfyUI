@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 import av
 import torch
@@ -16,10 +14,12 @@ class SaveWEBM(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="SaveWEBM",
-            category="image/video",
+            search_aliases=["export webm"],
+            display_name="Save WEBM",
+            category="video",
             is_experimental=True,
             inputs=[
-                io.Image.Input("images"),
+                io.Image.Input("images", tooltip="RGBA images are saved with their alpha channel as transparency (vp9 codec only)."),
                 io.String.Input("filename_prefix", default="ComfyUI"),
                 io.Combo.Input("codec", options=["vp9", "av1"]),
                 io.Float.Input("fps", default=24.0, min=0.01, max=1000.0, step=0.01),
@@ -45,18 +45,25 @@ class SaveWEBM(io.ComfyNode):
             for x in cls.hidden.extra_pnginfo:
                 container.metadata[x] = json.dumps(cls.hidden.extra_pnginfo[x])
 
+        # Save transparency when the images carry an alpha channel (RGBA) and the codec supports it.
+        # vp9 -> yuva420p; other codecs have no usable alpha path, so the alpha is ignored.
+        save_alpha = images.shape[-1] == 4 and codec == "vp9"
+
         codec_map = {"vp9": "libvpx-vp9", "av1": "libsvtav1"}
         stream = container.add_stream(codec_map[codec], rate=Fraction(round(fps * 1000), 1000))
         stream.width = images.shape[-2]
         stream.height = images.shape[-3]
-        stream.pix_fmt = "yuv420p10le" if codec == "av1" else "yuv420p"
+        stream.pix_fmt = "yuva420p" if save_alpha else ("yuv420p10le" if codec == "av1" else "yuv420p")
         stream.bit_rate = 0
         stream.options = {'crf': str(crf)}
         if codec == "av1":
             stream.options["preset"] = "6"
 
         for frame in images:
-            frame = av.VideoFrame.from_ndarray(torch.clamp(frame[..., :3] * 255, min=0, max=255).to(device=torch.device("cpu"), dtype=torch.uint8).numpy(), format="rgb24")
+            if save_alpha:
+                frame = av.VideoFrame.from_ndarray(torch.clamp(frame[..., :4] * 255, min=0, max=255).to(device=torch.device("cpu"), dtype=torch.uint8).numpy(), format="rgba")
+            else:
+                frame = av.VideoFrame.from_ndarray(torch.clamp(frame[..., :3] * 255, min=0, max=255).to(device=torch.device("cpu"), dtype=torch.uint8).numpy(), format="rgb24")
             for packet in stream.encode(frame):
                 container.mux(packet)
         container.mux(stream.encode())
@@ -69,8 +76,10 @@ class SaveVideo(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="SaveVideo",
+            search_aliases=["export video"],
             display_name="Save Video",
-            category="image/video",
+            category="video",
+            essentials_category="Basics",
             description="Saves the input images to your ComfyUI output directory.",
             inputs=[
                 io.Video.Input("video", tooltip="The video to save."),
@@ -116,8 +125,10 @@ class CreateVideo(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="CreateVideo",
+            search_aliases=["images to video"],
             display_name="Create Video",
-            category="image/video",
+            category="video",
+            essentials_category="Video Tools",
             description="Create a video from images.",
             inputs=[
                 io.Image.Input("images", tooltip="The images to create a video from."),
@@ -140,8 +151,9 @@ class GetVideoComponents(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="GetVideoComponents",
+            search_aliases=["extract frames", "split video", "video to images", "demux"],
             display_name="Get Video Components",
-            category="image/video",
+            category="video",
             description="Extracts all components from a video: frames, audio, and framerate.",
             inputs=[
                 io.Video.Input("video", tooltip="The video to extract components from."),
@@ -167,8 +179,10 @@ class LoadVideo(io.ComfyNode):
         files = folder_paths.filter_files_content_types(files, ["video"])
         return io.Schema(
             node_id="LoadVideo",
+            search_aliases=["import video", "open video", "video file"],
             display_name="Load Video",
-            category="image/video",
+            category="video",
+            essentials_category="Basics",
             inputs=[
                 io.Combo.Input("file", options=sorted(files), upload=io.UploadType.video),
             ],
@@ -197,6 +211,57 @@ class LoadVideo(io.ComfyNode):
 
         return True
 
+class VideoSlice(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="Video Slice",
+            display_name="Video Slice",
+            search_aliases=[
+                "trim video duration",
+                "skip first frames",
+                "frame load cap",
+                "start time",
+            ],
+            category="video",
+            essentials_category="Video Tools",
+            inputs=[
+                io.Video.Input("video"),
+                io.Float.Input(
+                    "start_time",
+                    default=0.0,
+                    max=1e5,
+                    min=-1e5,
+                    step=0.001,
+                    tooltip="Start time in seconds",
+                ),
+                io.Float.Input(
+                    "duration",
+                    default=0.0,
+                    min=0.0,
+                    step=0.001,
+                    tooltip="Duration in seconds, or 0 for unlimited duration",
+                ),
+                io.Boolean.Input(
+                    "strict_duration",
+                    default=False,
+                    tooltip="If True, when the specified duration is not possible, an error will be raised.",
+                ),
+            ],
+            outputs=[
+                io.Video.Output(),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, video: io.Video.Type, start_time: float, duration: float, strict_duration: bool) -> io.NodeOutput:
+        trimmed = video.as_trimmed(start_time, duration, strict_duration=strict_duration)
+        if trimmed is not None:
+            return io.NodeOutput(trimmed)
+        raise ValueError(
+            f"Failed to slice video:\nSource duration: {video.get_duration()}\nStart time: {start_time}\nTarget duration: {duration}"
+        )
+
 
 class VideoExtension(ComfyExtension):
     @override
@@ -207,6 +272,7 @@ class VideoExtension(ComfyExtension):
             CreateVideo,
             GetVideoComponents,
             LoadVideo,
+            VideoSlice,
         ]
 
 async def comfy_entrypoint() -> VideoExtension:

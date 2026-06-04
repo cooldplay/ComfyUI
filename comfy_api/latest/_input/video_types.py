@@ -34,6 +34,21 @@ class VideoInput(ABC):
         """
         pass
 
+    @abstractmethod
+    def as_trimmed(
+        self,
+        start_time: float | None = None,
+        duration: float | None = None,
+        strict_duration: bool = False,
+    ) -> VideoInput | None:
+        """
+        Create a new VideoInput which is trimmed to have the corresponding start_time and duration
+
+        Returns:
+            A new VideoInput, or None if the result would have negative duration
+        """
+        pass
+
     def get_stream_source(self) -> Union[str, io.BytesIO]:
         """
         Get a streamable source for the video. This allows processing without
@@ -49,6 +64,12 @@ class VideoInput(ABC):
         self.save_to(buffer)
         buffer.seek(0)
         return buffer
+
+    def get_active_trim_window(self) -> tuple[float, float]:
+        """Return the active trim as ``(start_time, duration)`` in seconds (start_time normalized
+        to ``>= 0``; ``duration == 0`` means "until the end"). Default: no trim; trimmable subclasses override.
+        """
+        return 0.0, 0.0
 
     # Provide a default implementation, but subclasses can provide optimized versions
     # if possible.
