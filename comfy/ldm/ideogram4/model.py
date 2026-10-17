@@ -12,10 +12,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import comfy.model_management
+import comfy.ops
 import comfy.patcher_extension
+import comfy.quant_ops
 from comfy.ldm.lumina.model import FeedForward
-from comfy.ldm.modules.attention import optimized_attention_masked
-from comfy.text_encoders.llama import apply_rope, precompute_freqs_cis
+from comfy.ldm.modules.attention import AttentionTensorContainer, ComfyAttention, optimized_attention_masked
+from comfy.text_encoders.llama import precompute_freqs_cis
 
 # Per-token role indicators
 SEQUENCE_PADDING_INDICATOR = -1
@@ -25,9 +28,26 @@ LLM_TOKEN_INDICATOR = 3
 IMAGE_POSITION_OFFSET = 65536
 
 
+def _split_half_rope_matrix(freqs_cis):
+    cos, sin, neg_sin = freqs_cis
+    half_dim = sin.shape[-1]
+    matrix = torch.stack(
+        (cos[..., :half_dim], neg_sin, sin, cos[..., half_dim:]), dim=-1
+    )
+    return matrix.reshape(*matrix.shape[:-1], 2, 2).unsqueeze(2)
+
+
+def _apply_rope_split_half1(x, freqs_cis):
+    x_dtype = x.dtype
+    x = x.reshape(*x.shape[:-1], 2, -1).movedim(-2, -1).unsqueeze(-2).to(freqs_cis.dtype)
+    output = freqs_cis[..., 0] * x[..., 0] + freqs_cis[..., 1] * x[..., 1]
+    return output.movedim(-1, -2).reshape(*x.shape[:-3], -1).to(x_dtype)
+
+
 class Ideogram4Attention(nn.Module):
     def __init__(self, hidden_size, num_heads, eps=1e-5, dtype=None, device=None, operations=None):
         super().__init__()
+        self.comfy_attention = ComfyAttention()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.hidden_size = hidden_size
@@ -42,17 +62,25 @@ class Ideogram4Attention(nn.Module):
         qkv = self.qkv(x).view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
 
-        q = self.norm_q(q)
-        k = self.norm_k(k)
+        if comfy.model_management.in_training:
+            q = _apply_rope_split_half1(self.norm_q(q), freqs_cis)
+            k = _apply_rope_split_half1(self.norm_k(k), freqs_cis)
+        else:
+            q_scale, _, q_offload_stream = comfy.ops.cast_bias_weight(self.norm_q, q, offloadable=True)
+            k_scale, _, k_offload_stream = comfy.ops.cast_bias_weight(self.norm_k, k, offloadable=True)
+            q, k = comfy.quant_ops.ck.rms_rope_split_half(
+                q, k, freqs_cis, q_scale, k_scale, self.norm_q.eps
+            )
+            comfy.ops.uncast_bias_weight(self.norm_q, q_scale, None, q_offload_stream)
+            comfy.ops.uncast_bias_weight(self.norm_k, k_scale, None, k_offload_stream)
 
         # (B, heads, L, head_dim)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        q = AttentionTensorContainer(q.transpose(1, 2))
+        k = AttentionTensorContainer(k.transpose(1, 2))
+        v = AttentionTensorContainer(v.transpose(1, 2))
+        del qkv
 
-        q, k = apply_rope(q, k, freqs_cis)
-
-        out = optimized_attention_masked(q, k, v, self.num_heads, attn_mask, skip_reshape=True, transformer_options=transformer_options)
+        out = optimized_attention_masked(q, k, v, self.num_heads, attn_mask, skip_reshape=True, preferred_attention=self.comfy_attention, transformer_options=transformer_options)
         return self.o(out)
 
 
@@ -106,11 +134,11 @@ class Ideogram4EmbedScalar(nn.Module):
         self.mlp_in = operations.Linear(dim, dim, bias=True, dtype=dtype, device=device)
         self.mlp_out = operations.Linear(dim, dim, bias=True, dtype=dtype, device=device)
 
-    def forward(self, x):
+    def forward(self, x, dtype):
         x = x.to(torch.float32)
         scaled = 1e4 * (x - self.range_min) / (self.range_max - self.range_min)
         emb = _sinusoidal_embedding(scaled, self.dim)
-        emb = emb.to(self.mlp_in.weight.dtype)
+        emb = emb.to(dtype)
         emb = F.silu(self.mlp_in(emb))
         return self.mlp_out(emb)
 
@@ -161,7 +189,7 @@ class Ideogram4Transformer(nn.Module):
         x = x * output_image_mask
         h = self.input_proj(x) * output_image_mask
 
-        t_cond = self.t_embedding(t)
+        t_cond = self.t_embedding(t, dtype=x.dtype)
         if t.dim() == 1:
             t_cond = t_cond.unsqueeze(1)
         adaln_input = F.silu(self.adaln_proj(t_cond))
@@ -174,13 +202,14 @@ class Ideogram4Transformer(nn.Module):
             llm = self.llm_cond_proj(llm) * text_mask
             h[:, :L_text] = h[:, :L_text] + llm
 
-        h = h + self.embed_image_indicator((indicator == OUTPUT_IMAGE_INDICATOR).to(torch.long))
+        h = h + self.embed_image_indicator((indicator == OUTPUT_IMAGE_INDICATOR).to(torch.long), out_dtype=h.dtype)
 
         # Qwen3-VL interleaved MRoPE; position_ids (B, L, 3) -> (3, L) (same across batch).
         freqs_cis = precompute_freqs_cis(
             self.head_dim, position_ids[0].transpose(0, 1), self.rope_theta,
             rope_dims=self.mrope_section, interleaved_mrope=True, device=position_ids.device,
         )
+        freqs_cis = _split_half_rope_matrix(freqs_cis)
 
         if attn_mask is not None and attn_mask.dtype == torch.bool:
             attn_mask = torch.zeros_like(attn_mask, dtype=h.dtype).masked_fill_(~attn_mask, -torch.finfo(h.dtype).max)
@@ -235,7 +264,7 @@ class Ideogram4Transformer2DModel(Ideogram4Transformer):
     def _run_conditional(self, x_chunk, context_chunk, attn_mask_chunk, t_chunk, gh, gw, transformer_options):
         B = x_chunk.shape[0]
         device = x_chunk.device
-        img_tokens = self._img_to_tokens(x_chunk).to(self.dtype)
+        img_tokens = self._img_to_tokens(x_chunk)
         L_img = img_tokens.shape[1]
         L_text = context_chunk.shape[1]
         L = L_text + L_img
@@ -268,7 +297,7 @@ class Ideogram4Transformer2DModel(Ideogram4Transformer):
     def _run_image_only(self, x_chunk, t_chunk, gh, gw, transformer_options):
         B = x_chunk.shape[0]
         device = x_chunk.device
-        img_tokens = self._img_to_tokens(x_chunk).to(self.dtype)
+        img_tokens = self._img_to_tokens(x_chunk)
         L_img = img_tokens.shape[1]
 
         position_ids = self._image_position_ids(gh, gw, device).unsqueeze(0).expand(B, L_img, 3)

@@ -1,3 +1,4 @@
+import json
 import node_helpers
 import comfy.utils
 from typing_extensions import override
@@ -13,7 +14,7 @@ class CLIPTextEncodeFlux(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="CLIPTextEncodeFlux",
-            category="advanced/conditioning/flux",
+            category="model/conditioning/flux",
             inputs=[
                 io.Clip.Input("clip"),
                 io.String.Input("clip_l", multiline=True, dynamic_prompts=True),
@@ -40,7 +41,7 @@ class EmptyFlux2LatentImage(io.ComfyNode):
         return io.Schema(
             node_id="EmptyFlux2LatentImage",
             display_name="Empty Flux 2 Latent",
-            category="model/latent",
+            category="model/latent/flux",
             inputs=[
                 io.Int.Input("width", default=1024, min=16, max=nodes.MAX_RESOLUTION, step=16),
                 io.Int.Input("height", default=1024, min=16, max=nodes.MAX_RESOLUTION, step=16),
@@ -61,7 +62,7 @@ class FluxGuidance(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="FluxGuidance",
-            category="advanced/conditioning/flux",
+            category="model/conditioning/flux",
             inputs=[
                 io.Conditioning.Input("conditioning"),
                 io.Float.Input("guidance", default=3.5, min=0.0, max=100.0, step=0.1),
@@ -84,7 +85,7 @@ class FluxDisableGuidance(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="FluxDisableGuidance",
-            category="advanced/conditioning/flux",
+            category="model/conditioning/flux",
             description="This node completely disables the guidance embed on Flux and Flux like models",
             inputs=[
                 io.Conditioning.Input("conditioning"),
@@ -128,7 +129,7 @@ class FluxKontextImageScale(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="FluxKontextImageScale",
-            category="advanced/conditioning/flux",
+            category="model/conditioning/flux",
             description="This node resizes the image to one that is more optimal for flux kontext.",
             inputs=[
                 io.Image.Input("image"),
@@ -156,7 +157,7 @@ class FluxKontextMultiReferenceLatentMethod(io.ComfyNode):
         return io.Schema(
             node_id="FluxKontextMultiReferenceLatentMethod",
             display_name="Edit Model Reference Method",
-            category="advanced/conditioning/flux",
+            category="model/conditioning/flux",
             inputs=[
                 io.Conditioning.Input("conditioning"),
                 io.Combo.Input(
@@ -245,6 +246,11 @@ class KV_Attn_Input:
         cache_key = "{}_{}".format(extra_options["block_type"], extra_options["block_index"])
         if cache_key in self.cache:
             kk, vv = self.cache[cache_key]
+
+            # Fix batch size changing.
+            kk = comfy.utils.repeat_to_batch_size(kk, k.shape[0])
+            vv = comfy.utils.repeat_to_batch_size(vv, v.shape[0])
+
             self.set_cache = False
             return {"q": q, "k": torch.cat((k, kk), dim=2), "v": torch.cat((v, vv), dim=2)}
 
@@ -295,6 +301,35 @@ class FluxKVCache(io.ComfyNode):
 
         return io.NodeOutput(m)
 
+class Flux3LayoutPrompt(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="Flux3LayoutPrompt",
+            display_name="FLUX 3 Image Layout Prompt",
+            category="model/conditioning/flux",
+            description="Appends the boxes from Create Bounding Boxes to a FLUX 3 Image prompt as its layout table.",
+            inputs=[
+                io.String.Input("prompt", multiline=True, dynamic_prompts=True,
+                                tooltip="The prompt text. Cite box N as <obj_N> to tie words to it."),
+                io.Array.Input("element", tooltip="Prompt elements from the node Create Bounding Boxes. Colour palettes are not used, describe colours in the description."),
+            ],
+            outputs=[io.String.Output(display_name="prompt")],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, prompt, element) -> io.NodeOutput:
+        rows = []
+        for i, el in enumerate(element if isinstance(element, list) else []):
+            desc = el.get("desc", "")
+            if el.get("type") == "text" and el.get("text"):
+                desc = f'{desc} "{el["text"]}"'.strip()
+            rows.append({"id": f"obj_{i + 1}", "bbox": el["bbox"], "desc": desc})
+        if not rows:
+            return io.NodeOutput(prompt)
+        return io.NodeOutput(f"{prompt.rstrip()} {json.dumps(rows, ensure_ascii=False)}")
+
 class FluxExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
@@ -307,6 +342,7 @@ class FluxExtension(ComfyExtension):
             EmptyFlux2LatentImage,
             Flux2Scheduler,
             FluxKVCache,
+            Flux3LayoutPrompt,
         ]
 
 
